@@ -1,0 +1,42 @@
+---
+mode: 'agent'
+description: "Perform a non-destructive cross-artifact consistency, coverage, and SMA quality analysis across spec.md, plan.md, and tasks.md after task generation."
+tools: ['codebase', 'runCommands', 'readFile', 'editFile', 'fetch']
+---
+
+## User Input
+
+```text
+${input:arguments}
+```
+
+You **MUST** consider the user input before proceeding (if not empty).
+
+## speckit.analyze — 跨文档一致性分析
+
+对 spec.md、plan.md、tasks.md 三大制品执行只读分析，检测不一致、覆盖缺口和 SMA 质量问题。
+
+### 阶段清单
+
+| 阶段 | 文件 | 职责 |
+|------|------|------|
+| 初始化 | .specify/phases/analyze/setup.md | 加载 persona + 制品 + 语义模型构建 |
+| 检测 A-G | .specify/phases/analyze/detection.md | 跨文档检测通道 |
+| 检测 H-J | .specify/phases/analyze/sma-detection.md | SMA 质量检测 |
+| 判决 | .specify/phases/analyze/verdict.md | 严重性分配 + Go/NoGo 判决 + 下一步 |
+
+### 执行协议
+
+**CRITICAL: 禁止一次性读取所有阶段文件。仅在即将执行该阶段时 Read 对应文件。**
+
+1. Read `.specify/phases/analyze/setup.md` → 初始化 + 加载制品 + 构建语义模型
+2. Read `detection.md` → 执行检测通道 A-G
+3. Read `sma-detection.md` → 执行 SMA 检测 H-J
+4. Read `verdict.md` → 生成报告 + 判决
+
+### 全局规则
+- **STRICTLY READ-ONLY**: Do **not** modify any files
+- 所有非代码内容使用简体中文
+- Constitution conflicts are automatically CRITICAL
+
+${input:arguments}

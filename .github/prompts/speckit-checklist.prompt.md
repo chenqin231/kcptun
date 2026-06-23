@@ -1,0 +1,38 @@
+---
+mode: 'agent'
+description: "Generate a custom checklist for the current feature based on user requirements."
+tools: ['codebase', 'runCommands', 'readFile', 'editFile', 'fetch']
+---
+
+## User Input
+
+```text
+${input:arguments}
+```
+
+You **MUST** consider the user input before proceeding (if not empty).
+
+## speckit.checklist — 需求质量 Checklist 生成
+
+生成"需求的单元测试"——验证需求文档的质量、清晰度和完整性。
+
+### 阶段清单
+
+| 阶段 | 文件 | 职责 |
+|------|------|------|
+| 初始化 | .specify/phases/checklist/setup.md | 加载 persona + 澄清意图 + 加载 context |
+| 生成 | .specify/phases/checklist/generate.md | 生成规则 + 分类结构 |
+| 报告 | .specify/phases/checklist/examples.md | 示例 + 反例 + 输出报告 |
+
+### 执行协议
+
+**CRITICAL: 禁止一次性读取所有阶段文件。仅在即将执行该阶段时 Read 对应文件。**
+
+1. Read `.specify/phases/checklist/setup.md` → 初始化 + 澄清意图 + 加载 feature context
+2. Read `generate.md` → 按规则生成 checklist
+3. Read `examples.md` → 对照示例/反例自检 + 输出报告
+
+### 全局规则
+- 所有非代码内容使用简体中文
+- Checklists are **UNIT TESTS FOR REQUIREMENTS** — test the spec, not the implementation
+- Each invocation creates a NEW file (never overwrites existing checklists)

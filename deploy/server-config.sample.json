@@ -1,0 +1,14 @@
+{
+  "listen": ":29900",
+  "target": "127.0.0.1:8388",
+  "key": "CHANGE_ME_到一个足够强的共享密钥",
+  "crypt": "aes",
+  "mode": "fast",
+  "mtu": 1350,
+  "sndwnd": 1024,
+  "rcvwnd": 1024,
+  "datashard": 10,
+  "parityshard": 3,
+  "dscp": 0,
+  "nocomp": false
+}

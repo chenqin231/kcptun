@@ -1,0 +1,24 @@
+{
+  "version": "6.12.1",
+  "installed_at": "2026-06-23T21:58:30+08:00",
+  "scope": "project",
+  "files": {},
+  "directories": [
+    ".agent",
+    ".ai",
+    ".claude",
+    ".gemini",
+    ".specify"
+  ],
+  "symlinks": [
+    ".agents/skills",
+    ".cursorrules",
+    ".github/coding-standards.md",
+    ".github/copilot-instructions.md",
+    ".github/development-standards.md",
+    ".windsurfrules",
+    "AGENTS.md",
+    "GEMINI.md"
+  ],
+  "settings_patches": {}
+}

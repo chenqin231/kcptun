@@ -1,0 +1,51 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "YOUR_GITHUB_PAT_HERE"
+      },
+      "description": "GitHub operations - PRs, issues, repos"
+    },
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "description": "Persistent memory across sessions"
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "description": "Chain-of-thought reasoning"
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@context7/mcp-server"],
+      "description": "Live documentation lookup"
+    },
+    "magic": {
+      "command": "npx",
+      "args": ["-y", "@magicuidesign/mcp@latest"],
+      "description": "Magic UI components"
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/your/projects"],
+      "description": "Filesystem operations (set your path)"
+    },
+    "firecrawl": {
+        "type": "stdio", 
+	"command": "npx", 
+	"args": ["-y", "firecrawl-mcp"],
+        "env": {
+           "FIRECRAWL_API_KEY": "fc-7bcc4185cf6a4649990b2825e89a4a99"
+        }
+    }
+  },
+  "_comments": {
+    "usage": "Copy the servers you need to your ~/.claude.json mcpServers section",
+    "env_vars": "Replace YOUR_*_HERE placeholders with actual values",
+    "disabling": "Use disabledMcpServers array in project config to disable per-project",
+    "context_warning": "Keep under 10 MCPs enabled to preserve context window"
+  }
+}

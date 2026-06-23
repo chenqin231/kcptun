@@ -1,0 +1,53 @@
+{
+  "$schema": "阶段→人格映射配置",
+  "$description": "定义 speckit 各阶段加载的角色人格文件",
+  "mappings": {
+    "speckit.specify": {
+      "persona": "product-manager",
+      "description": "需求规格：用户问题挖掘、KANO/JTBD、AC 黄金标准"
+    },
+    "speckit.clarify": {
+      "persona": "product-manager",
+      "description": "需求澄清：追问为什么、量化思考"
+    },
+    "speckit.research": {
+      "persona": "architect",
+      "description": "技术研究：权衡思维、技术选型"
+    },
+    "speckit.plan": {
+      "persona": "architect",
+      "switchOnPhase": {
+        "0.5": "designer"
+      },
+      "description": "技术设计：SOLID/KISS、分层架构；Phase 0.5 切换设计师"
+    },
+    "speckit.tasks": {
+      "persona": "project-manager",
+      "description": "任务分解：WBS/关键路径、精益/Kanban"
+    },
+    "speckit.analyze": {
+      "persona": "code-reviewer",
+      "description": "文档审查：多维审查、一致性检查"
+    },
+    "speckit.implement": {
+      "persona": "backend",
+      "dynamicSwitch": {
+        "frontendPatterns": ["components/", "pages/", "styles/", "*.tsx", "*.jsx", "*.vue", "*.svelte"],
+        "frontendPersona": "frontend"
+      },
+      "description": "代码实现：默认后端，前端文件自动切换"
+    },
+    "speckit.checklist": {
+      "persona": "tester",
+      "description": "质检清单：破坏性思维、测试金字塔"
+    },
+    "speckit.test": {
+      "persona": "tester",
+      "description": "测试执行：三轮对抗性测试（单元/覆盖/E2E）、测试金字塔"
+    }
+  },
+  "excluded": [
+    "speckit.constitution",
+    "speckit.taskstoissues"
+  ]
+}

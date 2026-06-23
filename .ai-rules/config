@@ -1,0 +1,14 @@
+# AI Rules 项目配置文件
+# 此文件由 ai-rules 自动生成和管理
+
+# 项目类型
+PROJECT_TYPE=generic
+
+# 安装模式（copy=复制模式，link=软链接模式）
+INSTALL_MODE=copy
+
+# 安装时间
+INSTALL_TIME=2026-06-23 21:58:28
+
+# 初始化时的规范版本
+INIT_VERSION=6.12.1
