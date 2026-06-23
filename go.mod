@@ -9,7 +9,7 @@ require (
 	github.com/xtaci/qpp v1.1.17
 	github.com/xtaci/smux v1.5.32
 	github.com/xtaci/tcpraw v1.2.31
-	golang.org/x/crypto v0.30.0
+	golang.org/x/crypto v0.53.0
 )
 
 require (
@@ -24,12 +24,10 @@ require (
 	github.com/templexxx/cpu v0.1.1 // indirect
 	github.com/templexxx/xorsimd v0.4.3 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
-	golang.org/x/net v0.29.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 )
 
 //replace github.com/xtaci/tcpraw => /home/xtaci/tcpraw
 
-go 1.22.3
-
-toolchain go1.23.0
+go 1.25.0
