@@ -8,12 +8,12 @@ require (
 	github.com/xtaci/kcp-go/v5 v5.6.18
 	github.com/xtaci/qpp v1.1.17
 	github.com/xtaci/smux v1.5.32
-	github.com/xtaci/tcpraw v1.2.31
+	github.com/xtaci/tcpraw v1.2.32
 	golang.org/x/crypto v0.30.0
 )
 
 require (
-	github.com/coreos/go-iptables v0.7.0 // indirect
+	github.com/coreos/go-iptables v0.8.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.5 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
