@@ -48,7 +48,8 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          mkdir -p dist
+          # 用独立输出目录,避免撞上仓库已有的 dist/(内含 freebsd、linux 等子目录)
+          rm -rf release-out && mkdir -p release-out
           LDFLAGS="-X main.VERSION=$VERSION -s -w"
           # 目标矩阵: GOOS GOARCH 后缀 产物归档名
           targets=(
@@ -67,13 +68,13 @@ jobs:
             CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
               go build -mod=vendor -trimpath -ldflags "$LDFLAGS" -o "server_${NAME}${SUF}" ./server
             if [ "$GOOS" = "windows" ]; then
-              zip -q "dist/kcptun-${NAME}.zip" "client_${NAME}${SUF}" "server_${NAME}${SUF}"
+              zip -q "release-out/kcptun-${NAME}.zip" "client_${NAME}${SUF}" "server_${NAME}${SUF}"
             else
-              tar -czf "dist/kcptun-${NAME}.tar.gz" "client_${NAME}${SUF}" "server_${NAME}${SUF}"
+              tar -czf "release-out/kcptun-${NAME}.tar.gz" "client_${NAME}${SUF}" "server_${NAME}${SUF}"
             fi
             rm -f "client_${NAME}${SUF}" "server_${NAME}${SUF}"
           done
-          cd dist && sha256sum * > SHA256SUMS.txt
+          cd release-out && sha256sum * > SHA256SUMS.txt
           echo "----- 产物清单 -----"
           ls -lh
 
@@ -94,6 +95,6 @@ jobs:
             | Linux ARM64 | kcptun-linux-arm64.tar.gz |
 
             校验: `SHA256SUMS.txt`。server 部署见仓库 `deploy/`。
-          files: dist/*
+          files: release-out/*
           draft: false
           prerelease: ${{ contains(steps.meta.outputs.tag, '-rc') }}
