@@ -37,10 +37,10 @@ type QPPPort struct {
 	rprng *qpp.Rand
 }
 
-func NewQPPPort(underlying io.ReadWriteCloser, qpp *qpp.QuantumPermutationPad, seed []byte) *QPPPort {
+func NewQPPPort(underlying io.ReadWriteCloser, pad *qpp.QuantumPermutationPad, seed []byte) *QPPPort {
 	wprng := qpp.CreatePRNG(seed)
 	rprng := qpp.CreatePRNG(seed)
-	return &QPPPort{underlying, qpp, wprng, rprng}
+	return &QPPPort{underlying, pad, wprng, rprng}
 }
 
 func (port *QPPPort) Read(p []byte) (n int, err error) {
