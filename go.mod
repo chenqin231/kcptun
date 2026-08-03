@@ -2,7 +2,7 @@ module github.com/xtaci/kcptun
 
 require (
 	github.com/fatih/color v1.19.0
-	github.com/golang/snappy v0.0.4
+	github.com/golang/snappy v1.0.0
 	github.com/pkg/errors v0.9.1
 	github.com/urfave/cli v1.22.17
 	github.com/xtaci/kcp-go/v5 v5.6.72
