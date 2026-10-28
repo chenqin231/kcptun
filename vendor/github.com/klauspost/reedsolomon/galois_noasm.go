@@ -12,10 +12,34 @@ func galMulSlice(c byte, in, out []byte, o *options) {
 		copy(out, in)
 		return
 	}
+	if !o.skip2B {
+		mt16 := getMulTable16(c)
+		for len(in) >= 8 {
+			store16(out, mt16[load16(in, 0)], 0)
+			store16(out, mt16[load16(in, 2)], 2)
+			store16(out, mt16[load16(in, 4)], 4)
+			store16(out, mt16[load16(in, 6)], 6)
+
+			in = in[8:]
+			out = out[8:]
+		}
+	}
+
 	mt := mulTable[c][:256]
 	for n, input := range in {
-		out[n] = mt[input]
+		store8(out, mt[input], n)
 	}
+}
+
+// 4-way butterfly with separate destination
+func ifftDIT4Dst(dst, work [][]byte, dist int, log_m01, log_m23, log_m02 ffe, o *options) {
+	ifftDIT4DstRef(dst, work, dist, log_m01, log_m23, log_m02, o)
+}
+
+// 4-way butterfly with separate destination
+func ifftDIT48Dst(dst, work [][]byte, dist int, log_m01, log_m23, log_m02 ffe8, o *options) {
+	// Fall back. Should not be called.
+	ifftDIT4DstRef8(dst, work, dist, log_m01, log_m23, log_m02, o)
 }
 
 func galMulSliceXor(c byte, in, out []byte, o *options) {
@@ -24,9 +48,21 @@ func galMulSliceXor(c byte, in, out []byte, o *options) {
 		sliceXor(in, out, o)
 		return
 	}
+	if !o.skip2B {
+		mt16 := getMulTable16(c)
+		for len(in) >= 8 {
+			store16(out, load16(out, 0)^mt16[load16(in, 0)], 0)
+			store16(out, load16(out, 2)^mt16[load16(in, 2)], 2)
+			store16(out, load16(out, 4)^mt16[load16(in, 4)], 4)
+			store16(out, load16(out, 6)^mt16[load16(in, 6)], 6)
+
+			in = in[8:]
+			out = out[8:]
+		}
+	}
 	mt := mulTable[c][:256]
-	for n, input := range in {
-		out[n] ^= mt[input]
+	for n := range in {
+		store8(out, load8(out, n)^mt[load8(in, n)], n)
 	}
 }
 
@@ -84,6 +120,14 @@ func ifftDIT28(x, y []byte, log_m ffe8, o *options) {
 
 func mulgf16(x, y []byte, log_m ffe, o *options) {
 	refMul(x, y, log_m)
+}
+
+func mulgf16Xor8(scalars *[8]uint16, in []byte, outs *[8][]byte, o *options) {
+	refMulAdd8x(scalars, in, outs)
+}
+
+func mulgf16Xor(x, y []byte, log_m ffe, o *options) {
+	refMulAdd(x, y, log_m)
 }
 
 func mulgf8(x, y []byte, log_m ffe8, o *options) {

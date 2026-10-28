@@ -46,7 +46,6 @@
 package kcp
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"hash/crc32"
@@ -125,6 +124,8 @@ type (
 		l       *Listener      // pointing to the Listener object if it's been accepted by a Listener
 		block   BlockCrypt     // block encryption object
 
+		updateFn func() // s.update, made once so rescheduling does not allocate
+
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
 		recvbuf []byte
@@ -135,13 +136,15 @@ type (
 		fecEncoder *fecEncoder
 
 		// settings
-		remote     net.Addr     // remote peer address
-		rd         atomic.Value // read deadline
-		wd         atomic.Value // write deadline
-		headerSize int          // the header size additional to a KCP frame
-		ackNoDelay bool         // send ack immediately for each incoming packet(testing purpose)
-		writeDelay bool         // delay kcp.flush() for Write() for bulk transfer
-		dup        int          // duplicate udp packets(testing purpose)
+		remote     net.Addr               // remote peer address
+		pushedFrom net.Addr               // peer pinned by pushedPacket when remote is nil
+		rd         atomic.Value           // read deadline
+		readNotify atomic.Pointer[func()] // see SetReadNotify
+		wd         atomic.Value           // write deadline
+		headerSize int                    // the header size additional to a KCP frame
+		ackNoDelay bool                   // send ack immediately for each incoming packet(testing purpose)
+		writeDelay bool                   // delay kcp.flush() for Write() for bulk transfer
+		dup        int                    // duplicate udp packets(testing purpose)
 
 		// notifications
 		die          chan struct{} // notify current session has Closed
@@ -159,6 +162,12 @@ type (
 
 		// packets waiting to be sent on wire
 		chPostProcessing chan sendRequest
+		ppRunning        atomic.Bool // queued for or served by a postProcess worker
+		ppHeld           struct {    // a batch waiting for the rate limiter
+			w     *ppWorker
+			bytes int
+			until time.Time
+		}
 
 		// platform-dependent optimizations
 		platform platform
@@ -235,6 +244,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 			// delivery to post processing (non-blocking to avoid deadlock under lock)
 			select {
 			case sess.chPostProcessing <- sendRequest{bts, false}:
+				sess.kickPostProcess()
 			case <-sess.die:
 				return
 			default:
@@ -249,18 +259,20 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 		panic("Overhead too large")
 	}
 
-	// create post-processing goroutine
-	go sess.postProcess()
-
 	if sess.l == nil { // it's a client connection
-		go sess.readLoop()
+		if pp, ok := conn.(PacketPusher); ok {
+			pp.SetPacketReceiver(sess.pushedPacket)
+		} else {
+			go sess.readLoop()
+		}
 		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
 	} else {
 		atomic.AddUint64(&DefaultSnmp.PassiveOpens, 1)
 	}
 
 	// start per-session updater
-	SystemTimedSched.Put(sess.update, time.Now())
+	sess.updateFn = sess.update
+	SystemTimedSched.Put(sess.updateFn, time.Now())
 
 	currestab := atomic.AddUint64(&DefaultSnmp.CurrEstab, 1)
 	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
@@ -273,87 +285,30 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 // Read implements net.Conn
 func (s *UDPSession) Read(b []byte) (n int, err error) {
+	// The deadline timer is armed only when the read has to wait.
 	var timeout *time.Timer
-	var c <-chan time.Time
-
-RESET_TIMER:
-	// deadline for current reading operation
-	if trd, ok := s.rd.Load().(time.Time); ok && !trd.IsZero() {
-		if timeout == nil {
-			timeout = time.NewTimer(time.Until(trd))
-			c = timeout.C
-			defer timeout.Stop()
-		} else {
-			// Pre-Go 1.23: Reset does not drain the channel;
-			// callers must drain at the goto-site before arriving here.
-			timeout.Reset(time.Until(trd))
-		}
-	} else if timeout != nil {
-		timeout.Stop()
-		c = nil // disable timeout select case
-	}
-
 	for {
 		s.mu.Lock()
-		// bufptr points to the current position of recvbuf,
-		// if previous 'b' is insufficient to accommodate the data, the
-		// remaining data will be stored in bufptr for next read.
-		if len(s.bufptr) > 0 {
-			n = copy(b, s.bufptr)
-			s.bufptr = s.bufptr[n:]
-			s.mu.Unlock()
-			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
-			return n, nil
-		}
-
-		if size := s.kcp.PeekSize(); size > 0 { // peek data size from kcp
-			// if 'b' is large enough to accommodate the data, read directly
-			// from kcp.recv() to 'b', like 'DMA'.
-			if len(b) >= size {
-				s.kcp.Recv(b)
-				s.mu.Unlock()
-				atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
-				return size, nil
-			}
-
-			// otherwise, read to recvbuf first, then copy to 'b'.
-			// dynamically adjust the buffer size to the maximum of 'packet size' when necessary.
-			if cap(s.recvbuf) < size {
-				// usually recvbuf has a size of maximum packet size
-				s.recvbuf = make([]byte, size)
-			}
-
-			// resize the length of recvbuf to match the data size
-			s.recvbuf = s.recvbuf[:size]
-			s.kcp.Recv(s.recvbuf)    // read data to recvbuf first
-			n = copy(b, s.recvbuf)   // then copy bytes to 'b' as many as possible
-			s.bufptr = s.recvbuf[n:] // pointer update
-
-			s.mu.Unlock()
-			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
-			return n, nil
-		}
-
+		n, ok := s.readLocked(b)
 		s.mu.Unlock()
+		if ok {
+			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
+			return n, nil
+		}
 
 		// if it runs here, that means we have to block the call, and wait until the
 		// next data packet arrives.
+		c := armDeadline(&timeout, &s.rd)
 		select {
 		case <-s.chReadEvent:
-			if timeout != nil {
-				if !timeout.Stop() {
-					select {
-					case <-timeout.C:
-					default:
-					}
-				}
-				goto RESET_TIMER
-			}
+			stopTimer(timeout)
 		case <-c:
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketReadError:
+			stopTimer(timeout)
 			return 0, s.socketReadError.Load().(error)
 		case <-s.die:
+			stopTimer(timeout)
 			return 0, errors.WithStack(io.ErrClosedPipe)
 		}
 	}
@@ -364,25 +319,20 @@ func (s *UDPSession) Write(b []byte) (n int, err error) { return s.WriteBuffers(
 
 // WriteBuffers write a vector of byte slices to the underlying connection
 func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
-	var timeout *time.Timer
-	var c <-chan time.Time
-
-RESET_TIMER:
-	if twd, ok := s.wd.Load().(time.Time); ok && !twd.IsZero() {
-		if timeout == nil {
-			timeout = time.NewTimer(time.Until(twd))
-			c = timeout.C
-			defer timeout.Stop()
-		} else {
-			// Pre-Go 1.23: Reset does not drain the channel;
-			// callers must drain at the goto-site before arriving here.
-			timeout.Reset(time.Until(twd))
+	// An empty write only reports the conn's state. It used to run a full
+	// flush, which callers that probe with Write(nil) paid on every frame.
+	if buffersEmpty(v) {
+		select {
+		case <-s.chSocketWriteError:
+			return 0, s.socketWriteError.Load().(error)
+		case <-s.die:
+			return 0, errors.WithStack(io.ErrClosedPipe)
+		default:
+			return 0, nil
 		}
-	} else if timeout != nil {
-		timeout.Stop()
-		c = nil // disable timeout select case
 	}
-
+	// The deadline timer is armed only when the write has to wait.
+	var timeout *time.Timer
 	for {
 		// check for connection close and socket error
 		select {
@@ -429,22 +379,17 @@ RESET_TIMER:
 
 		// if it runs here, that means we have to block the call, and wait until the
 		// transmit buffer to become available again.
+		c := armDeadline(&timeout, &s.wd)
 		select {
 		case <-s.chWriteEvent:
-			if timeout != nil {
-				if !timeout.Stop() {
-					select {
-					case <-timeout.C:
-					default:
-					}
-				}
-				goto RESET_TIMER
-			}
+			stopTimer(timeout)
 		case <-c:
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketWriteError:
+			stopTimer(timeout)
 			return 0, s.socketWriteError.Load().(error)
 		case <-s.die:
+			stopTimer(timeout)
 			return 0, errors.WithStack(io.ErrClosedPipe)
 		}
 	}
@@ -472,6 +417,7 @@ func (s *UDPSession) Close() error {
 	}
 
 	atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
+	s.callReadNotify()
 
 	// try best to send all queued messages especially the data in txqueue
 	s.mu.Lock()
@@ -481,6 +427,10 @@ func (s *UDPSession) Close() error {
 	if s.l != nil { // belongs to listener
 		s.l.closeSession(s.remote)
 		return nil
+	}
+
+	if pp, ok := s.conn.(PacketPusher); ok {
+		pp.SetPacketReceiver(nil)
 	}
 
 	if s.ownConn { // client socket close
@@ -671,131 +621,116 @@ func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
 	return f(s.conn)
 }
 
-// postProcess is the goroutine that handles the outgoing packet pipeline.
+// postProcess runs the outgoing packet pipeline for s on a shared worker.
 // It runs the following stages sequentially for each packet:
 //  1. FEC encoding   — generate parity shards (Reed-Solomon)
 //  2. Encryption     — AEAD (e.g. AES-GCM) or CFB mode with CRC32
 //  3. TX batching    — accumulate packets and flush via sendmmsg/writev
 //
 // Pipeline: KCP output -> chPostProcessing -> [FEC] -> [Encrypt] -> TxQueue -> Network
-func (s *UDPSession) postProcess() {
-	txqueue := make([]ipv4.Message, 0, devBacklog)
-	chDie := s.die
-
-	ctx := context.Background()
+//
+// It returns once the queue is empty, after ppBudget packets, or when s keeps
+// a batch for the rate limiter, and reports whether s needs serving again.
+func (s *UDPSession) postProcess(w *ppWorker) bool {
 	bytesToSend := 0
-	for {
+	for n := 0; n < ppBudget; n++ {
+		var req sendRequest
 		select {
-		case req := <-s.chPostProcessing: // dequeue from post processing
-			buf := req.buffer
-			oob := req.oob
+		case req = <-s.chPostProcessing: // dequeue from post processing
+		default:
+			return false
+		}
+		buf := req.buffer
+		oob := req.oob
 
-			var ecc [][]byte
+		var ecc [][]byte
 
-			// --- Stage 1: FEC encoding ---
-			if s.fecEncoder != nil {
-				if !oob {
-					ecc = s.fecEncoder.encode(buf, maxFECEncodeLatency)
-				} else {
-					s.fecEncoder.encodeOOB(buf)
-				}
+		// --- Stage 1: FEC encoding ---
+		if s.fecEncoder != nil {
+			if !oob {
+				ecc = s.fecEncoder.encode(buf, maxFECEncodeLatency)
+			} else {
+				s.fecEncoder.encodeOOB(buf)
 			}
+		}
 
-			// --- Stage 2: Encryption ---
-			// Two modes supported:
-			//   - AEAD (e.g. AES-GCM): nonce + authenticated ciphertext, no separate CRC
-			//   - CFB (legacy block ciphers): random nonce + CRC32 checksum + CFB encryption
-			switch block := s.block.(type) {
-			case nil:
-			case *aeadCrypt: // AEAD mode
-				nonceSize := block.NonceSize()
+		// --- Stage 2: Encryption ---
+		// Two modes supported:
+		//   - AEAD (e.g. AES-GCM): nonce + authenticated ciphertext, no separate CRC
+		//   - CFB (legacy block ciphers): random nonce + CRC32 checksum + CFB encryption
+		switch block := s.block.(type) {
+		case nil:
+		case *aeadCrypt: // AEAD mode
+			nonceSize := block.NonceSize()
 
-				dst := buf[:nonceSize]
-				nonce := buf[:nonceSize]
-				plaintext := buf[nonceSize:]
+			dst := buf[:nonceSize]
+			nonce := buf[:nonceSize]
+			plaintext := buf[nonceSize:]
+
+			fillRand(nonce)
+			buf = block.Seal(dst, nonce, plaintext, nil)
+
+			for k := range ecc {
+				dst := ecc[k][:nonceSize]
+				nonce := ecc[k][:nonceSize]
+				plaintext := ecc[k][nonceSize:]
 
 				fillRand(nonce)
-				buf = block.Seal(dst, nonce, plaintext, nil)
-
-				for k := range ecc {
-					dst := ecc[k][:nonceSize]
-					nonce := ecc[k][:nonceSize]
-					plaintext := ecc[k][nonceSize:]
-
-					fillRand(nonce)
-					ecc[k] = block.Seal(dst, nonce, plaintext, nil)
-				}
-			default: // Cipher Feedback (CFB) mode
-				fillRand(buf[:nonceSize])
-				checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
-				binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
-				block.Encrypt(buf, buf)
-
-				for k := range ecc {
-					fillRand(ecc[k][:nonceSize])
-					checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
-					binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
-					block.Encrypt(ecc[k], ecc[k])
-				}
+				ecc[k] = block.Seal(dst, nonce, plaintext, nil)
 			}
+		default: // Cipher Feedback (CFB) mode
+			fillRand(buf[:nonceSize])
+			checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
+			binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
+			block.Encrypt(buf, buf)
 
-			// --- Stage 3: TX batching ---
-			var msg ipv4.Message
-			msg.Addr = s.remote
-
-			// original copy, move buf to txqueue directly
-			msg.Buffers = [][]byte{buf}
-			bytesToSend += len(buf)
-			txqueue = append(txqueue, msg)
-
-			// dup copies for testing if set
-			for i := 0; i < s.dup; i++ {
-				bts := defaultBufferPool.Get()[:len(buf)]
-				copy(bts, buf)
-				msg.Buffers = [][]byte{bts}
-				bytesToSend += len(bts)
-				txqueue = append(txqueue, msg)
-			}
-
-			// parity
 			for k := range ecc {
-				bts := defaultBufferPool.Get()[:len(ecc[k])]
-				copy(bts, ecc[k])
-				msg.Buffers = [][]byte{bts}
-				bytesToSend += len(bts)
-				txqueue = append(txqueue, msg)
+				fillRand(ecc[k][:nonceSize])
+				checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
+				binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
+				block.Encrypt(ecc[k], ecc[k])
 			}
+		}
 
-			// transmit when chPostProcessing is empty or we've reached max batch size
-			if len(s.chPostProcessing) == 0 || len(txqueue) >= maxBatchSize {
-				if limiter, ok := s.rateLimiter.Load().(*rate.Limiter); ok {
-					// WaitN only returns error if the limiter is misconfigured
-					// or context is cancelled. In either case, we continue sending.
-					_ = limiter.WaitN(ctx, bytesToSend)
-				}
-				s.tx(txqueue)
-				s.kcp.debugLog(IKCP_LOG_OUTPUT, "conv", s.kcp.conv, "datalen", bytesToSend)
-				// recycle
-				for k := range txqueue {
-					defaultBufferPool.Put(txqueue[k].Buffers[0])
-					txqueue[k].Buffers = nil
-				}
-				txqueue = txqueue[:0]
-				bytesToSend = 0
+		// --- Stage 3: TX batching ---
+		var msg ipv4.Message
+		msg.Addr = s.remote
+
+		// original copy, move buf to txqueue directly
+		msg.Buffers = w.oneBuf(buf)
+		bytesToSend += len(buf)
+		w.txqueue = append(w.txqueue, msg)
+
+		// dup copies for testing if set
+		for i := 0; i < s.dup; i++ {
+			bts := defaultBufferPool.Get()[:len(buf)]
+			copy(bts, buf)
+			msg.Buffers = w.oneBuf(bts)
+			bytesToSend += len(bts)
+			w.txqueue = append(w.txqueue, msg)
+		}
+
+		// parity
+		for k := range ecc {
+			bts := defaultBufferPool.Get()[:len(ecc[k])]
+			copy(bts, ecc[k])
+			msg.Buffers = w.oneBuf(bts)
+			bytesToSend += len(bts)
+			w.txqueue = append(w.txqueue, msg)
+		}
+
+		// transmit when chPostProcessing is empty or we've reached max batch size
+		if len(s.chPostProcessing) == 0 || len(w.txqueue) >= maxBatchSize {
+			if s.flushTx(w, bytesToSend) {
+				return true
 			}
-
-			// re-enable die channel
-			chDie = s.die
-
-		case <-chDie:
-			// remaining packets in txqueue should be sent out
-			if len(s.chPostProcessing) > 0 {
-				chDie = nil // block chDie temporarily
-				continue
-			}
-			return
+			bytesToSend = 0
 		}
 	}
+	if len(w.txqueue) > 0 && s.flushTx(w, bytesToSend) {
+		return true
+	}
+	return len(s.chPostProcessing) > 0
 }
 
 // sess update to trigger protocol
@@ -811,7 +746,11 @@ func (s *UDPSession) update() {
 		}
 		s.mu.Unlock()
 		// self-synchronized timed scheduling
-		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
+		fn := s.updateFn
+		if fn == nil {
+			fn = s.update
+		}
+		SystemTimedSched.Put(fn, time.Now().Add(time.Duration(interval)*time.Millisecond))
 	}
 }
 
@@ -918,6 +857,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	// Performs OOB framing, encryption, and transmission, bypassing FEC and KCP.
 	select {
 	case s.chPostProcessing <- sendRequest{buf, true}:
+		s.kickPostProcess()
 		return nil
 	case <-s.die:
 		// Session is closing.
@@ -936,6 +876,7 @@ func (s *UDPSession) notifyReadEvent() {
 	case s.chReadEvent <- struct{}{}:
 	default:
 	}
+	s.callReadNotify()
 }
 
 func (s *UDPSession) notifyWriteEvent() {
@@ -950,6 +891,7 @@ func (s *UDPSession) notifyReadError(err error) {
 		s.socketReadError.Store(err)
 		close(s.chSocketReadError)
 	})
+	s.callReadNotify()
 }
 
 func (s *UDPSession) notifyWriteError(err error) {
@@ -1390,6 +1332,10 @@ func (l *Listener) Close() error {
 		return errors.WithStack(io.ErrClosedPipe)
 	}
 
+	l.sessionLock.Lock()
+	l.releasePusherLocked()
+	l.sessionLock.Unlock()
+
 	if l.ownConn {
 		return l.conn.Close()
 	}
@@ -1413,9 +1359,26 @@ func (l *Listener) closeSession(remote net.Addr) (ret bool) {
 
 	if _, ok := l.sessions[remote.String()]; ok {
 		delete(l.sessions, remote.String())
+		l.releasePusherLocked()
 		return true
 	}
 	return false
+}
+
+// releasePusherLocked removes the PacketPusher receiver once the Listener is
+// closed and its last session has gone. sessionLock must be held.
+func (l *Listener) releasePusherLocked() {
+	select {
+	case <-l.die:
+	default:
+		return
+	}
+	if len(l.sessions) > 0 {
+		return
+	}
+	if pp, ok := l.conn.(PacketPusher); ok {
+		pp.SetPacketReceiver(nil)
+	}
 }
 
 // Addr returns the listener's network address, The Addr returned is shared by all invocations of Addr, so do not modify it.
@@ -1469,7 +1432,11 @@ func serveConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 	l.parityShards = parityShards
 	l.block = block
 	l.chSocketReadError = make(chan struct{})
-	go l.monitor()
+	if pp, ok := conn.(PacketPusher); ok {
+		pp.SetPacketReceiver(l.pushedPacket)
+	} else {
+		go l.monitor()
+	}
 	return l, nil
 }
 
@@ -1531,4 +1498,111 @@ func NewConn(raddr string, block BlockCrypt, dataShards, parityShards int, conn 
 		return nil, errors.WithStack(err)
 	}
 	return NewConn2(udpaddr, block, dataShards, parityShards, conn)
+}
+
+// armDeadline starts or resets t for the deadline held in v, just before a
+// blocking wait, and returns its channel. It returns nil without a deadline.
+func armDeadline(t **time.Timer, v *atomic.Value) <-chan time.Time {
+	d, ok := v.Load().(time.Time)
+	if !ok || d.IsZero() {
+		return nil
+	}
+	if *t == nil {
+		*t = time.NewTimer(time.Until(d))
+	} else {
+		(*t).Reset(time.Until(d))
+	}
+	return (*t).C
+}
+
+// stopTimer stops t, if armed, and drains a fire it may have left.
+func stopTimer(t *time.Timer) {
+	if t != nil && !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
+// buffersEmpty reports whether v holds no bytes.
+func buffersEmpty(v [][]byte) bool {
+	for _, b := range v {
+		if len(b) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// readLocked copies data that is ready into b and reports whether there was
+// any. It must be called with s.mu held.
+func (s *UDPSession) readLocked(b []byte) (int, bool) {
+	// bufptr points to the current position of recvbuf,
+	// if previous 'b' is insufficient to accommodate the data, the
+	// remaining data will be stored in bufptr for next read.
+	if len(s.bufptr) > 0 {
+		n := copy(b, s.bufptr)
+		s.bufptr = s.bufptr[n:]
+		return n, true
+	}
+
+	size := s.kcp.PeekSize() // peek data size from kcp
+	if size <= 0 {
+		return 0, false
+	}
+	// if 'b' is large enough to accommodate the data, read directly
+	// from kcp.recv() to 'b', like 'DMA'.
+	if len(b) >= size {
+		s.kcp.Recv(b)
+		return size, true
+	}
+
+	// otherwise, read to recvbuf first, then copy to 'b'.
+	// dynamically adjust the buffer size to the maximum of 'packet size' when necessary.
+	if cap(s.recvbuf) < size {
+		// usually recvbuf has a size of maximum packet size
+		s.recvbuf = make([]byte, size)
+	}
+
+	// resize the length of recvbuf to match the data size
+	s.recvbuf = s.recvbuf[:size]
+	s.kcp.Recv(s.recvbuf)    // read data to recvbuf first
+	n := copy(b, s.recvbuf)  // then copy bytes to 'b' as many as possible
+	s.bufptr = s.recvbuf[n:] // pointer update
+	return n, true
+}
+
+// TryRead is Read without waiting. It returns 0 and no error when no data is
+// ready, and the session's error once it is closed or its socket failed and
+// no data is left.
+func (s *UDPSession) TryRead(b []byte) (int, error) {
+	s.mu.Lock()
+	n, ok := s.readLocked(b)
+	s.mu.Unlock()
+	if ok {
+		atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
+		return n, nil
+	}
+	select {
+	case <-s.chSocketReadError:
+		return 0, s.socketReadError.Load().(error)
+	case <-s.die:
+		return 0, errors.WithStack(io.ErrClosedPipe)
+	default:
+		return 0, nil
+	}
+}
+
+// SetReadNotify sets fn to be called whenever data may have become ready for
+// TryRead, and when the session closes or its socket fails. fn runs with the
+// session locked, so it must not block or call into the session.
+func (s *UDPSession) SetReadNotify(fn func()) {
+	s.readNotify.Store(&fn)
+}
+
+func (s *UDPSession) callReadNotify() {
+	if fn := s.readNotify.Load(); fn != nil {
+		(*fn)()
+	}
 }
