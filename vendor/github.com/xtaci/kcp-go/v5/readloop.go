@@ -98,3 +98,56 @@ func (l *Listener) defaultMonitor() {
 		l.packetInput(buf[:n], from)
 	}
 }
+
+// PacketPusher is a net.PacketConn that can hand each received packet to a
+// callback instead of being read. A client session or Listener on such a
+// conn runs no read goroutine and processes each packet inside the callback,
+// OOB handlers included, so a slow handler delays every conn the pusher
+// serves.
+//
+// The pusher must not call fn concurrently, just as one goroutine reads a
+// conn. fn may modify b but must not keep it after returning. A non-nil err
+// ends reads. Closing a client session, or a Listener once its sessions have
+// closed, sets a nil fn, which must remove the receiver.
+type PacketPusher interface {
+	SetPacketReceiver(fn func(b []byte, addr net.Addr, err error))
+}
+
+// pushedPacket is the PacketPusher callback of a client session.
+func (s *UDPSession) pushedPacket(b []byte, addr net.Addr, err error) {
+	if err != nil {
+		s.notifyReadError(errors.WithStack(err))
+		return
+	}
+	if s.isClosed() {
+		return
+	}
+	// Without a remote address, pin the peer to the first packet as
+	// defaultReadLoop does.
+	src := s.remote
+	if src == nil {
+		if s.pushedFrom == nil {
+			s.pushedFrom = addr
+		}
+		src = s.pushedFrom
+	}
+	if udp, ok := src.(*net.UDPAddr); ok {
+		if a, ok := addr.(*net.UDPAddr); !ok || !sameUDPAddr(udp, a) {
+			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			return
+		}
+	} else if addr.String() != src.String() {
+		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+		return
+	}
+	s.packetInput(b)
+}
+
+// pushedPacket is the PacketPusher callback of a Listener.
+func (l *Listener) pushedPacket(b []byte, addr net.Addr, err error) {
+	if err != nil {
+		l.notifyReadError(errors.WithStack(err))
+		return
+	}
+	l.packetInput(b, addr)
+}

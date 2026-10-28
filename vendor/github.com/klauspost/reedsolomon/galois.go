@@ -8,6 +8,7 @@ package reedsolomon
 
 import (
 	"encoding/binary"
+	"sync"
 )
 
 const (
@@ -914,14 +915,18 @@ func genCodeGenMatrix(matrixRows [][]byte, inputs, inIdx, outputs, vectorLength 
 	if !codeGen {
 		panic("codegen not enabled")
 	}
-	total := inputs * outputs
+	paddedInputs := max(codeGenPadInputs, inputs)
+	total := paddedInputs * outputs
 
-	// Duplicated in+out
 	wantBytes := total * vectorLength * 2
 	if cap(dst) < wantBytes {
 		dst = AllocAligned(1, wantBytes)[0]
 	} else {
 		dst = dst[:wantBytes]
+	}
+	// Zero padding region — reused pool buffers may have stale coefficients.
+	if paddedInputs > inputs {
+		clear(dst[inputs*outputs*vectorLength*2 : wantBytes])
 	}
 	for i, row := range matrixRows[:outputs] {
 		for j, idx := range row[inIdx : inIdx+inputs] {
@@ -977,4 +982,28 @@ func sliceXorGo(in, out []byte, _ *options) {
 	for n, input := range in {
 		out[n] ^= input
 	}
+}
+
+// Combines 2 lookups into one.
+// 32MB in total.
+var mulTable16 *[256][65536]uint16
+var mulTable16Init sync.Once
+
+// getMulTable16 will return the 65536 entry table for the given column byte.
+func getMulTable16(c byte) *[65536]uint16 {
+	mulTable16Init.Do(func() {
+		mulTable16 = &[256][65536]uint16{}
+		// Generate two byte lookup table for multiplication
+		for i := range 256 {
+			t0 := &mulTable[i]
+			t1 := &mulTable16[i]
+			for j := range 256 {
+				for k := range 256 {
+					dst := j*256 + k
+					t1[dst] = uint16(t0[j])<<8 | uint16(t0[k])
+				}
+			}
+		}
+	})
+	return &mulTable16[c]
 }
